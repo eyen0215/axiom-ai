@@ -102,6 +102,42 @@ HOOKE_ASSUMPTION_ORDER: List[str] = [
     "A1_linearity", "A2_elasticity", "A3_small_strain", "A4_homogeneity",
 ]
 
+# ---------------------------------------------------------------------------
+# Fourier heat conduction domain configuration
+# ---------------------------------------------------------------------------
+
+FOURIER_LABEL_COLS: Dict[str, str] = {
+    "A1_continuum":          "valid_continuum",
+    "A2_steady_state":       "valid_steady_state",
+    "A3_linear_response":    "valid_linear_response",
+    "A4_local_equilibrium":  "valid_local_equilibrium",
+}
+
+FOURIER_ASSUMPTION_LABELS: Dict[str, str] = {
+    "A1_continuum":         "A1 - Continuum (Kn = lambda/L < 0.1)",
+    "A2_steady_state":      "A2 - Steady state (Fo = alpha*t/L^2 > 1)",
+    "A3_linear_response":   "A3 - Linear response (1.65*dT/dx*L/T < 0.1)",
+    "A4_local_equilibrium": "A4 - Local equilibrium (t > 1 ps)",
+}
+
+FOURIER_DERIVED_ORDER: List[str] = [
+    "D1_continuum_field",
+    "D2_constitutive_law",
+    "D3_heat_equation",
+    "D4_fourier_law",
+]
+
+FOURIER_NODE_LABELS: Dict[str, str] = {
+    "D1_continuum_field":  "D1 - Continuum temperature field",
+    "D2_constitutive_law": "D2 - Fourier constitutive law  q = -k*dT/dx",
+    "D3_heat_equation":    "D3 - Full heat equation",
+    "D4_fourier_law":      "D4 - Fourier's Law (steady state)  [PRIMARY]",
+}
+
+FOURIER_ASSUMPTION_ORDER: List[str] = [
+    "A1_continuum", "A2_steady_state", "A3_linear_response", "A4_local_equilibrium",
+]
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers

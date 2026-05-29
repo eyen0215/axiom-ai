@@ -511,6 +511,256 @@ def train_all_hooke_predicates(
     return predicates
 
 
+# ===========================================================================
+# FOURIER HEAT CONDUCTION DOMAIN -- three-attempt training
+# ===========================================================================
+#
+# Three feature-set strategies are trained and compared:
+#
+#   Attempt 1 (criterion)     : each predicate receives only its scalar
+#                               criterion (Kn, Fo, A3_ratio, t), log-transformed.
+#                               Minimal information -- same strategy as Hooke's.
+#
+#   Attempt 2 (observables)   : each predicate receives all five observables
+#                               (T, L, t, dT_dx, dT_dt), all log-transformed.
+#                               Forces the skip to discover the boundary from
+#                               raw measurements.  All Fourier criteria are
+#                               log-linear in log-observables, so the skip can
+#                               represent them exactly -- IF there is no
+#                               collinearity in training.
+#
+#   Attempt 3 (criterion+obs) : criterion scalar + all five observables.
+#                               Provides both the direct signal and context.
+#
+# See DECISIONS.md for analysis of which attempts succeed and why.
+# ---------------------------------------------------------------------------
+
+from data.generate import (
+    SILICON_LAMBDA, SILICON_K0, SILICON_RHO, SILICON_C, SILICON_K_EXP,
+    ELECTRON_PHONON_TIME,
+    KN_THRESHOLD, FO_THRESHOLD, A3_THRESHOLD,
+    _silicon_alpha,
+)
+
+FOURIER_TRAINABLE_ASSUMPTIONS = frozenset({
+    "A1_continuum", "A2_steady_state", "A3_linear_response", "A4_local_equilibrium"
+})
+
+# Observable column names as stored in the DataFrame
+FOURIER_OBS_COLS = ["T", "L", "t", "dT_dx", "dT_dt"]
+
+# Per-assumption criterion scalar columns
+FOURIER_CRITERION_COLS: Dict[str, list] = {
+    "A1_continuum":          ["Kn"],
+    "A2_steady_state":       ["Fo"],
+    "A3_linear_response":    ["A3_ratio"],
+    "A4_local_equilibrium":  ["t"],
+}
+
+# Criterion + all observables
+FOURIER_CRITERION_OBS_COLS: Dict[str, list] = {
+    aid: FOURIER_CRITERION_COLS[aid] + FOURIER_OBS_COLS
+    for aid in FOURIER_CRITERION_COLS
+}
+
+
+def compute_fourier_log_criterion(
+    df: pd.DataFrame,
+    assumption_id: str,
+) -> Optional[np.ndarray]:
+    """Return log-criterion regression target for one Fourier assumption.
+
+    Target = log(criterion_value / threshold) or log(value / boundary):
+        > 0  when assumption is satisfied (all training states)
+        = 0  at the validity boundary
+        < 0  when assumption is violated (held-out states)
+
+    Formulas
+    --------
+    A1: log(KN_THRESHOLD / Kn) = log(0.1 * L / lambda)
+    A2: log(Fo / FO_THRESHOLD) = log(alpha*t / L^2)
+    A3: log(A3_THRESHOLD / A3_ratio) = log(0.1 * T / (1.65 * |dT_dx| * L))
+    A4: log(t / ELECTRON_PHONON_TIME) = log(t / 1e-12)
+    """
+    if assumption_id == "A1_continuum":
+        Kn = SILICON_LAMBDA / df["L"].values.clip(1e-20)
+        return np.log(KN_THRESHOLD / Kn).astype(np.float32)
+
+    if assumption_id == "A2_steady_state":
+        alpha = _silicon_alpha(df["T"].values)
+        Fo    = alpha * df["t"].values / df["L"].values.clip(1e-20)**2
+        return np.log(Fo / FO_THRESHOLD + 1e-30).astype(np.float32)
+
+    if assumption_id == "A3_linear_response":
+        ratio = 1.65 * df["dT_dx"].values.clip(1e-30) * df["L"].values.clip(1e-20) / df["T"].values.clip(1.0)
+        return np.log(A3_THRESHOLD / ratio + 1e-30).astype(np.float32)
+
+    if assumption_id == "A4_local_equilibrium":
+        return np.log(df["t"].values.clip(1e-30) / ELECTRON_PHONON_TIME).astype(np.float32)
+
+    return None
+
+
+def _train_fourier_predicate_core(
+    assumption_id: str,
+    feat_cols: list,
+    log_transform_cols: tuple,
+    train_df: pd.DataFrame,
+    *,
+    hidden_dims: tuple = (32, 16),
+    lr: float = 1e-2,
+    n_epochs: int = 600,
+    val_frac: float = 0.15,
+    patience: int = 60,
+    seed: int = 0,
+    verbose: bool = False,
+) -> Optional[ValidityPredicate]:
+    """Shared training loop used by all three Fourier attempts.
+
+    Parameters
+    ----------
+    feat_cols          : which DataFrame columns to use as features
+    log_transform_cols : indices within feat_cols to log-transform in forward()
+    """
+    log_targets = compute_fourier_log_criterion(train_df, assumption_id)
+    if log_targets is None:
+        return None
+
+    X_raw = train_df[feat_cols].values.astype(np.float32)
+    y_all = log_targets
+
+    torch.manual_seed(seed)
+    rng   = np.random.default_rng(seed)
+    idx   = rng.permutation(len(X_raw))
+    n_val = max(1, int(val_frac * len(X_raw)))
+    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+
+    X_tr_raw, y_tr = X_raw[tr_idx], y_all[tr_idx]
+    X_val_raw, y_val = X_raw[val_idx], y_all[val_idx]
+
+    # Normalise on (optionally log-transformed) training features
+    X_tr_log = X_tr_raw.copy()
+    for col in log_transform_cols:
+        X_tr_log[:, col] = np.log(np.clip(X_tr_raw[:, col], 1e-30, None))
+    feat_mean = X_tr_log.mean(axis=0).astype(np.float32)
+    feat_std  = (X_tr_log.std(axis=0) + 1e-8).astype(np.float32)
+
+    predicate = ValidityPredicate(
+        hidden_dims=hidden_dims,
+        n_features=len(feat_cols),
+        log_transform_cols=log_transform_cols,
+        feature_cols=feat_cols,
+    )
+    predicate.set_normalization(feat_mean, feat_std)
+
+    optimizer = torch.optim.Adam([
+        {"params": predicate.skip.parameters(), "weight_decay": 0.0},
+        {"params": predicate.mlp.parameters(),  "weight_decay": 5.0},
+    ], lr=lr)
+    loss_fn = nn.MSELoss()
+
+    X_tr_t  = torch.from_numpy(X_tr_raw)
+    y_tr_t  = torch.from_numpy(y_tr)
+    X_val_t = torch.from_numpy(X_val_raw)
+    y_val_t = torch.from_numpy(y_val)
+
+    best_val, best_sd, no_improve = float("inf"), None, 0
+
+    for epoch in range(1, n_epochs + 1):
+        predicate.train()
+        optimizer.zero_grad()
+        loss_fn(predicate(X_tr_t), y_tr_t).backward()
+        optimizer.step()
+
+        predicate.eval()
+        with torch.no_grad():
+            val_loss = loss_fn(predicate(X_val_t), y_val_t).item()
+
+        if val_loss < best_val - 1e-8:
+            best_val, best_sd, no_improve = val_loss, copy.deepcopy(predicate.state_dict()), 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                if verbose:
+                    print(f"    [{assumption_id}] early stop @ epoch {epoch}  "
+                          f"best val MSE = {best_val:.6f}")
+                break
+
+        if verbose and epoch % 100 == 0:
+            print(f"    [{assumption_id}]  epoch {epoch:4d}  "
+                  f"train={loss_fn(predicate(X_tr_t), y_tr_t).item():.5f}  "
+                  f"val={val_loss:.5f}")
+
+    if best_sd is not None:
+        predicate.load_state_dict(best_sd)
+    return predicate
+
+
+def train_all_fourier_predicates(
+    graph,
+    train_df: pd.DataFrame,
+    attempt: int = 1,
+    verbose: bool = True,
+    **train_kwargs,
+) -> Dict[str, ValidityPredicate]:
+    """Train one ValidityPredicate per Fourier assumption, using the given attempt.
+
+    Parameters
+    ----------
+    attempt : 1 = per-criterion scalar  (Kn, Fo, A3_ratio, t)
+              2 = all observables        (T, L, t, dT_dx, dT_dt)
+              3 = criterion + observables
+
+    Returns
+    -------
+    Dict mapping assumption_id -> trained ValidityPredicate.
+    """
+    # All Fourier criteria are log-linear in log-features, so log-transform all.
+    # For attempt 1: 1 feature (the criterion scalar), log-transform col 0.
+    # For attempt 2: 5 features (observables), log-transform all.
+    # For attempt 3: 6 features (criterion + 5 observables), log-transform all.
+
+    predicates: Dict[str, ValidityPredicate] = {}
+
+    for node in graph.assumption_nodes():
+        aid = node.id
+        if verbose:
+            print(f"  [{aid}]", end=" ", flush=True)
+
+        if attempt == 1:
+            feat_cols = FOURIER_CRITERION_COLS.get(aid)
+            log_cols  = tuple(range(len(feat_cols))) if feat_cols else ()
+        elif attempt == 2:
+            feat_cols = FOURIER_OBS_COLS
+            log_cols  = tuple(range(len(FOURIER_OBS_COLS)))
+        else:  # attempt 3
+            feat_cols = FOURIER_CRITERION_OBS_COLS.get(aid, FOURIER_OBS_COLS)
+            log_cols  = tuple(range(len(feat_cols)))
+
+        if feat_cols is None:
+            if verbose:
+                print("skipped (no criterion)")
+            continue
+
+        pred = _train_fourier_predicate_core(
+            aid, feat_cols, log_cols, train_df,
+            verbose=False, **train_kwargs,
+        )
+        if pred is None:
+            if verbose:
+                print("skipped (no criterion)")
+            continue
+
+        node.attach_predicate(pred)
+        predicates[aid] = pred
+        if verbose:
+            # Diagnostic: report skip weights for the primary feature
+            w = pred.skip.weight.data.numpy().ravel()
+            print(f"done  skip_w={w}")
+
+    return predicates
+
+
 # ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------

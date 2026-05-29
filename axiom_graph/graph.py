@@ -557,3 +557,161 @@ def build_hooke_law_graph() -> AxiomGraph:
     ))
 
     return g
+
+
+# ---------------------------------------------------------------------------
+# Fourier heat conduction axiom graph
+# ---------------------------------------------------------------------------
+
+def build_fourier_law_graph() -> AxiomGraph:
+    """Construct and return the hardcoded Fourier heat conduction axiom DAG.
+
+    Derivation of q = -k*dT/dx (1D steady-state Fourier's Law) from four
+    assumptions about silicon heat conduction.
+
+    Node prefixes:
+        obs_*  -- observable quantities: T, L, t, dT_dx, dT_dt
+        A1..A4 -- physical assumptions (get validity predicates)
+        D1..D4 -- derived intermediate and final results
+
+    Edge topology (premises -> conclusion):
+
+        FE1: [A1, A4]      -> D1_continuum_field     local T(x) well-defined
+        FE2: [D1, A3]      -> D2_constitutive_law    q = -k*dT/dx
+        FE3: [D2]          -> D3_heat_equation       rho*c*dT/dt = d/dx(k*dT/dx)
+        FE4: [D3, A2]      -> D4_fourier_law         q = -k*dT/dx (steady state)
+
+    Ancestor assumptions of D4: {A1, A2, A3, A4} -- all four.
+    """
+    g = AxiomGraph()
+
+    # ---- Observable nodes ------------------------------------------------
+    for nid, lbl, desc in [
+        ("obs_T",    "Temperature T",        "Local temperature in K."),
+        ("obs_L",    "Feature size L",       "Characteristic length scale in m."),
+        ("obs_t",    "Timescale t",          "Characteristic heating timescale in s."),
+        ("obs_dTdx", "Temperature gradient", "dT/dx in K/m, the driving gradient."),
+        ("obs_dTdt", "Heating rate",         "dT/dt in K/s, temporal rate of change."),
+    ]:
+        g.add_node(Node(id=nid, kind="observable", label=lbl, description=desc))
+
+    # ---- Assumption nodes ------------------------------------------------
+    g.add_node(Node(
+        id="A1_continuum", kind="assumption",
+        label="Continuum (A1)",
+        description=(
+            "Feature size L is much larger than the phonon mean free path lambda. "
+            "Kn = lambda/L < 0.1.  Violated in nanoscale structures where phonon "
+            "transport is ballistic rather than diffusive."
+        ),
+    ))
+    g.add_node(Node(
+        id="A2_steady_state", kind="assumption",
+        label="Steady state (A2)",
+        description=(
+            "The system has reached thermal quasi-equilibrium: Fourier number "
+            "Fo = alpha*t/L^2 > 1.  Violated in transient heating where the "
+            "thermal diffusion time L^2/alpha exceeds the observation timescale."
+        ),
+    ))
+    g.add_node(Node(
+        id="A3_linear_response", kind="assumption",
+        label="Linear response (A3)",
+        description=(
+            "Thermal conductivity k(T) is approximately constant over the "
+            "temperature drop across L: 1.65*|dT/dx|*L/T < 0.1.  Violated "
+            "when k varies significantly (silicon k propto T^{-1.65} is "
+            "strongly nonlinear at high T or large gradients)."
+        ),
+    ))
+    g.add_node(Node(
+        id="A4_local_equilibrium", kind="assumption",
+        label="Local thermal equilibrium (A4)",
+        description=(
+            "Electrons and phonons are in equilibrium: heating timescale t > 1 ps. "
+            "Violated in ultrafast (femtosecond) laser heating where the "
+            "electron-phonon coupling time is ~1 ps in silicon."
+        ),
+    ))
+
+    # ---- Derived nodes ---------------------------------------------------
+    g.add_node(Node(
+        id="D1_continuum_field", kind="derived",
+        label="Continuum temperature field",
+        description=(
+            "A1 (L >> lambda) allows defining a smooth temperature field T(x). "
+            "A4 (local equilibrium) ensures T is a well-defined thermodynamic "
+            "quantity at each point."
+        ),
+    ))
+    g.add_node(Node(
+        id="D2_constitutive_law", kind="derived",
+        label="Fourier constitutive law  q = -k*dT/dx",
+        description=(
+            "Given a continuum temperature field (D1) and linear-response k (A3), "
+            "the heat flux is proportional to the gradient: q = -k*dT/dx."
+        ),
+    ))
+    g.add_node(Node(
+        id="D3_heat_equation", kind="derived",
+        label="Heat equation  rho*c*dT/dt = d/dx(k*dT/dx)",
+        description=(
+            "Energy conservation combined with the constitutive law (D2) gives "
+            "the full time-dependent heat equation."
+        ),
+    ))
+    g.add_node(Node(
+        id="D4_fourier_law", kind="derived",
+        label="Fourier's Law  q = -k*dT/dx  [PRIMARY]",
+        description=(
+            "Under steady-state conditions (A2: Fo > 1), the time derivative "
+            "vanishes and the heat equation reduces to Fourier's Law: "
+            "q = -k*nabla T with k treated as a constant."
+        ),
+    ))
+
+    # ---- Edges -----------------------------------------------------------
+    g.add_edge(DerivationEdge(
+        id="FE1",
+        premise_ids=["A1_continuum", "A4_local_equilibrium"],
+        conclusion_id="D1_continuum_field",
+        rule_label="Continuum + local equil -> smooth T(x)",
+        description=(
+            "A1 ensures L >> lambda so phonon transport is diffusive and T(x) "
+            "is a valid continuum field.  A4 ensures electrons and phonons share "
+            "a common temperature at each point."
+        ),
+    ))
+    g.add_edge(DerivationEdge(
+        id="FE2",
+        premise_ids=["D1_continuum_field", "A3_linear_response"],
+        conclusion_id="D2_constitutive_law",
+        rule_label="Continuum field + linear k -> q = -k*dT/dx",
+        description=(
+            "With a smooth temperature field (D1) and approximately constant k "
+            "(A3), Fourier's constitutive hypothesis gives q = -k*dT/dx."
+        ),
+    ))
+    g.add_edge(DerivationEdge(
+        id="FE3",
+        premise_ids=["D2_constitutive_law"],
+        conclusion_id="D3_heat_equation",
+        rule_label="Constitutive law + energy conservation -> heat equation",
+        description=(
+            "Substituting q = -k*dT/dx into the energy conservation equation "
+            "rho*c*dT/dt = -d(q)/dx gives the full heat equation."
+        ),
+    ))
+    g.add_edge(DerivationEdge(
+        id="FE4",
+        premise_ids=["D3_heat_equation", "A2_steady_state"],
+        conclusion_id="D4_fourier_law",
+        rule_label="Heat equation + Fo > 1 -> steady q = -k*dT/dx",
+        description=(
+            "A2 (Fo > 1) guarantees the transient term rho*c*dT/dt is negligible "
+            "relative to the conduction term, leaving the steady-state form "
+            "d^2T/dx^2 = 0, i.e. q = -k*dT/dx = const."
+        ),
+    ))
+
+    return g

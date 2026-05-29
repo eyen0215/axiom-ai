@@ -6,7 +6,7 @@
 - [x] axiom_graph/ 
 - [x] reasoner/provenance.py
 - [x] validity_predicates/
-- [ ] experiments/pilot.py — in progress
+- [x] experiments/pilot.py — complete (3-domain: ideal gas, Hooke's, Fourier)
 
 Update this section manually at the end of each session.
 

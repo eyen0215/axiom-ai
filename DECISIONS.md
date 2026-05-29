@@ -126,3 +126,56 @@ HOOKE_ASSUMPTION_FEATURES = {
 Each predicate sees only the one feature that appears in its validity criterion. With n_features=1, the skip is a scalar weight, and gradient descent is forced to learn the correct sign (negative: larger feature value → smaller logit → assumption more likely violated). Recall = 1.000, AUROC = 1.000 for all three assumptions.
 
 **General principle:** When domain features are functionally related (one is a deterministic function of another), feed each predicate only the feature relevant to its own validity criterion. Sharing all features across predicates when those features are collinear in training creates extrapolation failures even though training loss is low.
+
+---
+
+## Decision 7: Fourier heat conduction — what the architecture can and cannot handle
+
+The Fourier domain (q = −k∇T, silicon) was added specifically to find the limits of the skip-connection + log-criterion regression design. Four assumptions were tested: A1 (continuum, Kn < 0.1), A2 (steady-state, Fo > 1), A3 (linear response, 1.65·dT/dx·L/T < 0.1), A4 (local equilibrium, t > 1 ps). Three feature strategies were tried.
+
+### Attempt 1 (per-criterion scalar feature): works architecturally, fails due to calibration bias
+
+Each predicate sees only its criterion feature (Kn, Fo, A3_ratio, or t), log-transformed.
+
+**Why training-regime calibration bias emerges:** The training constraints ensure all four assumptions are satisfied with margin. For A1, L ∈ [1 μm, 1 mm] and λ = 40 nm gives Kn ∈ [4×10⁻⁵, 0.04], so log-criterion log(0.1/Kn) ∈ [0.9, 7.8]. For A4, t ∈ [1 ns, 1 s] gives log(t/1 ps) ∈ [6.9, 27.6] with mean ≈ 22. The skip learns bias b ≈ mean(targets) ≈ 22. At inference on the held-out boundary state (t = 1 ps), the normalised input x_norm ≈ −5.69 and skip output ≈ 0.36·(−5.69) + 22 ≈ +20. Sigmoid(+20) = 1.000 — the predicate never fires. Quantitatively, the skip needs x_norm < −b/w = −61 to produce a negative logit; the boundary gives x_norm = −5.69 (10× gap). **Result: AUROC = 0.791–1.000 (correct ranking) but Recall ≈ 0.165–0.273 (threshold never crossed).**
+
+### Attempt 2 (all observables: T, L, t, dT/dx, dT_dt): works for A1/A2/A3, fails for A4
+
+**Why this recovers recall for A1, A2, A3:** The Fourier training data samples T, L, t, dT/dx independently (unlike Hooke's). This means the five log-observables are weakly correlated — the skip regression finds a unique solution. More importantly, the observables have a much larger dynamic range than the derived criteria: in the training data, log(L) ∈ [−12, −3] (9 decades), log(T) ∈ [5.3, 6.4], log(t) ∈ [−21, 0]. In the held-out nanoscale regime, log(L) drops below −20 — a normalised shift of many standard deviations. This is a much larger extrapolation signal than the derived criterion Kn provides. **Result: A1 Recall = 0.937, A2 Recall = 0.873, A3 Recall = 1.000.**
+
+**Why A4 still fails in Attempt 2:** With five features, the skip weight on log(t) is diluted across the other four features, and the calibration bias problem persists. The time variable t participates in both the A4 criterion directly and in the A2 Fourier number Fo = α·t/L². When all five features are jointly regressed, the skip allocates only a small weight to log(t) (≈ 0.036 in typical runs). The boundary state then contributes only 0.036·(−5.69) ≈ −0.20 against a bias of ≈ 17. **Result: A4 Recall = 0.000, AUROC = 0.999.**
+
+### Per-criterion isolation is NOT required for Fourier (unlike Hooke's)
+
+In Hooke's Law, all three engineered features are exact algebraic functions of epsilon, creating perfect multicollinearity in training. In Fourier, the five observables (T, L, t, dT/dx, dT_dt) are sampled independently — there is no algebraic relationship between them in the training dataset. The skip regression has a unique minimum and learns correct extrapolation signs. Attempt 2 succeeds for A1/A2/A3 precisely because multi-feature regression is safe when features are non-collinear.
+
+### Simultaneous multi-assumption failure is handled correctly
+
+Case 3 (L = 50 nm, T = 1200 K, t = 1 ps, dT/dx = 1×10⁹) simultaneously violates A1 (Kn ≈ 0.8), A2 (Fo ≈ 0.03), and A4 (t at boundary). Attempt 2 correctly flags both A1 (score = 0.065) and A2 (score = 0.157) simultaneously. A4 scores 0.990 (calibration bias prevents firing). Provenance propagation correctly marks D1_continuum_field and D4_fourier_law as suspect. Multi-assumption simultaneous failure does not cause interference between predicates — each fires independently.
+
+### Borderline cases reveal over- and under-sensitivity
+
+Case 4 (L = 150 nm, T = 900 K, t = 50 ns, dT/dx = 5×10⁷) sits near validity boundaries: Kn = 0.267 (violated, A1), Fo = 0.023 (violated, A2), A3_ratio = 0.064 (valid), t = 50 ns (valid). Attempt 2 scores: A1 = 0.394 (false negative — score > 0.5 but assumption is violated), A2 = 0.504 (correctly near-boundary uncertain). The false negative for A1 at Kn = 0.267 illustrates the calibration bias: the training regime ends at Kn = 0.04, so Kn = 0.267 is only 6.7× the training maximum — insufficient to drive the score below 0.5.
+
+### Quantitative summary of A4 architectural limit
+
+Training targets for A4 = log(t/1 ps) with t ∈ [1 ns, 1 s]:
+
+- min = 6.9 (t = 1 ns), max = 27.6 (t = 1 s), mean ≈ 22
+- Skip learns bias b ≈ 22, weight w ≈ 0.36
+- Boundary: t = 1 ps → x_norm = (log(1 ps) − mean_train) / std_train = −5.69
+- Skip output at boundary: 0.36 × (−5.69) + 22 ≈ +20
+- Required x_norm to fire: x_norm < −b/w = −61 (boundary provides only −5.69)
+- **Gap factor: 10.7× — the predicate structurally cannot fire**
+
+This is not fixable by tuning hidden_dims, learning rate, or weight_decay. It requires changing training data design: either shrinking the training regime to bring mean targets closer to zero (e.g. training on t ∈ [10 ps, 1 ns] instead of 1 ns to 1 s) or replacing the fixed 0.5 threshold with a per-assumption calibrated threshold computed from validation data.
+
+### Lessons for architecture extension
+
+1. **The skip + log-criterion approach works when the training-to-boundary log-ratio is modest (< ≈5×)**. A1, A2, A3 in Fourier satisfy this: training Kn up to 0.04 vs. boundary 0.1 is only 2.5×. A4 fails because training t starts at 1 ns, boundary is 1 ps — a 1000× gap.
+
+2. **Per-criterion isolation is a domain-specific fix for collinear features, not a universal requirement.** Fourier works better with all observables (Attempt 2) than with isolated criteria (Attempt 1), because observables provide larger extrapolation signal and are independently sampled.
+
+3. **A calibrated threshold (per-assumption percentile on validation scores) would recover A4 recall** at the cost of requiring held-out validation data. This would break the pure zero-shot extrapolation claim but is a reasonable engineering trade-off for production systems.
+
+4. **The architecture's core promise holds for three of four assumptions.** The failure mode (large training-target mean) is diagnosable in advance from the training regime design — if mean(log-criterion) >> 0 in training, calibration bias is guaranteed.

@@ -466,6 +466,226 @@ def generate_hooke_dataset(
     return train_df, held_out_df
 
 
+# ===========================================================================
+# FOURIER HEAT CONDUCTION DOMAIN
+# ===========================================================================
+#
+# Synthetic data for Fourier's Law: q = -k*dT/dx (silicon, 1D conduction).
+#
+# Four assumptions and their analytical validity criteria:
+#
+#   A1 (Continuum)          : Kn = lambda/L < KN_THRESHOLD = 0.1
+#                             Violated when phonon mean free path is not << L.
+#
+#   A2 (Steady state)       : Fo = alpha*t/L^2 > FO_THRESHOLD = 1.0
+#                             Violated when system hasn't reached thermal equil.
+#
+#   A3 (Linear response)    : 1.65 * |dT/dx| * L / T < A3_THRESHOLD = 0.1
+#                             Violated when k(T) varies significantly across L.
+#                             (silicon: k(T) = k0*(T/300)^{-1.65})
+#
+#   A4 (Local equilibrium)  : t > ELECTRON_PHONON_TIME = 1ps
+#                             Violated in ultrafast laser heating (non-equil.).
+#
+# Training regime  (all assumptions satisfied by construction):
+#   L in [1 um, 1 mm]  (log-uniform)
+#   T in [200, 600] K
+#   t sampled so Fo > 1 and t > 1 ns
+#   dT/dx sampled so A3 ratio < 0.1
+#
+# Held-out regime (three simultaneous failure modes, all labeled):
+#   Nanoscale:  L < 100 nm  (Kn > 0.4 >> 0.1 -> A1 violated)
+#   High-T:     T > 1000 K  (A3 more easily violated with large gradient)
+#   Ultrafast:  t < 10 ps   (A4 violated when t < 1 ps; A2 often violated too)
+# ---------------------------------------------------------------------------
+
+# Silicon material constants
+SILICON_K0        = 150.0     # W/(m*K) thermal conductivity at 300 K
+SILICON_LAMBDA    = 40e-9     # m  phonon mean free path (~40 nm)
+SILICON_RHO       = 2329.0    # kg/m^3  density
+SILICON_C         = 700.0     # J/(kg*K)  specific heat
+SILICON_K_EXP     = -1.65     # k(T) = K0 * (T/300)^K_EXP (empirical fit)
+
+ELECTRON_PHONON_TIME = 1e-12  # s  electron-phonon coupling time (~1 ps Si)
+
+# Validity thresholds
+KN_THRESHOLD  = 0.1   # Kn < 0.1  for continuum assumption
+FO_THRESHOLD  = 1.0   # Fo > 1    for steady-state assumption
+A3_THRESHOLD  = 0.1   # A3_ratio < 0.1  for linear-response assumption
+
+# Training regime bounds
+FOURIER_L_TRAIN_LOW  = 1e-6   # 1 um
+FOURIER_L_TRAIN_HIGH = 1e-3   # 1 mm
+FOURIER_T_TRAIN_LOW  = 200.0  # K
+FOURIER_T_TRAIN_HIGH = 600.0  # K
+FOURIER_T_MIN        = 1e-9   # 1 ns  (ensures A4 always valid in training)
+FOURIER_DTDX_LOW     = 1e3    # K/m
+FOURIER_DTDX_HIGH    = 1e9    # K/m
+
+# Held-out regime failure thresholds
+FOURIER_L_NANO_MAX   = 100e-9  # 100 nm  (L below this -> A1 fails)
+FOURIER_T_HOT_MIN    = 1000.0  # K       (T above this -> hot regime)
+FOURIER_T_FAST_MAX   = 10e-12  # 10 ps   (t below this -> ultrafast regime)
+
+
+def _silicon_k(T: np.ndarray) -> np.ndarray:
+    """Effective thermal conductivity of silicon: k(T) = k0*(T/300)^{-1.65}."""
+    return SILICON_K0 * (np.clip(T, 1.0, None) / 300.0) ** SILICON_K_EXP
+
+
+def _silicon_alpha(T: np.ndarray) -> np.ndarray:
+    """Thermal diffusivity alpha = k/(rho*c) for silicon."""
+    return _silicon_k(T) / (SILICON_RHO * SILICON_C)
+
+
+def compute_fourier_validity_labels(
+    T: np.ndarray,
+    L: np.ndarray,
+    t: np.ndarray,
+    dT_dx: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Analytically compute per-assumption validity labels for Fourier's Law.
+
+    Returns
+    -------
+    valid_continuum          : A1  Kn = lambda/L < 0.1
+    valid_steady_state       : A2  Fo = alpha*t/L^2 > 1
+    valid_linear_response    : A3  1.65*|dT_dx|*L/T < 0.1
+    valid_local_equilibrium  : A4  t > 1 ps
+    """
+    Kn       = SILICON_LAMBDA / np.clip(L, 1e-20, None)
+    alpha    = _silicon_alpha(T)
+    Fo       = alpha * np.clip(t, 0, None) / np.clip(L**2, 1e-40, None)
+    A3_ratio = 1.65 * np.abs(dT_dx) * np.clip(L, 0, None) / np.clip(T, 1.0, None)
+
+    return (
+        Kn       < KN_THRESHOLD,
+        Fo       > FO_THRESHOLD,
+        A3_ratio < A3_THRESHOLD,
+        t        > ELECTRON_PHONON_TIME,
+    )
+
+
+def generate_fourier_training(
+    n_samples: int,
+    rng: np.random.Generator,
+    noise_frac: float = 0.002,
+) -> pd.DataFrame:
+    """Sample training states where all four Fourier assumptions are satisfied.
+
+    L is log-uniform in [1 um, 1 mm].  T is uniform in [200, 600] K.
+    t is log-uniform in [max(L^2/alpha, 1 ns), 1 s] to guarantee Fo > 1 and A4.
+    dT/dx is log-uniform in [1e3, min(1e9, 0.1*T/(1.65*L))] to guarantee A3.
+    """
+    L = np.exp(rng.uniform(
+        np.log(FOURIER_L_TRAIN_LOW), np.log(FOURIER_L_TRAIN_HIGH), n_samples
+    ))
+    T = rng.uniform(FOURIER_T_TRAIN_LOW, FOURIER_T_TRAIN_HIGH, n_samples)
+
+    alpha   = _silicon_alpha(T)
+    t_min   = np.maximum(L**2 / alpha, FOURIER_T_MIN)  # Fo=1 boundary or 1ns
+    t_min   = np.minimum(t_min, 0.9)                   # guard: keep below t_max=1s
+    log_t   = rng.uniform(np.log(t_min), np.log(np.ones(n_samples)))
+    t       = np.exp(log_t)
+
+    dtdx_max = np.minimum(A3_THRESHOLD * T / (1.65 * L), FOURIER_DTDX_HIGH)
+    dtdx_max = np.maximum(dtdx_max, FOURIER_DTDX_LOW * 1.01)  # ensure range exists
+    log_dtdx = rng.uniform(np.log(FOURIER_DTDX_LOW * np.ones(n_samples)), np.log(dtdx_max))
+    dT_dx    = np.exp(log_dtdx)
+
+    # Small measurement noise
+    T     = np.clip(T     * (1 + rng.normal(0, noise_frac, n_samples)), 50.0, None)
+    L     = np.clip(L     * (1 + rng.normal(0, noise_frac, n_samples)), 1e-11, None)
+    t     = np.clip(t     * (1 + rng.normal(0, noise_frac, n_samples)), 1e-15, None)
+    dT_dx = np.clip(dT_dx * (1 + rng.normal(0, noise_frac, n_samples)), 1.0, None)
+
+    dT_dt = dT_dx * L / t  # characteristic heating rate
+    vc, vs, vl, ve = compute_fourier_validity_labels(T, L, t, dT_dx)
+
+    return pd.DataFrame({
+        "T": T, "L": L, "t": t, "dT_dx": dT_dx, "dT_dt": dT_dt,
+        "Kn": SILICON_LAMBDA / L,
+        "Fo": _silicon_alpha(T) * t / L**2,
+        "A3_ratio": 1.65 * dT_dx * L / T,
+        "regime": "train",
+        "valid_continuum":         vc,
+        "valid_steady_state":      vs,
+        "valid_linear_response":   vl,
+        "valid_local_equilibrium": ve,
+    })
+
+
+def generate_fourier_held_out(
+    n_samples: int,
+    rng: np.random.Generator,
+    noise_frac: float = 0.002,
+) -> pd.DataFrame:
+    """Sample held-out states covering all three Fourier failure modes.
+
+    Each quarter of the held-out set targets a distinct failure regime so that
+    all assumptions and multi-assumption failures are represented:
+      - Nanoscale  (L < 100 nm)         A1 violated
+      - High-T     (T > 1000 K)         A3 more easily violated
+      - Ultrafast  (t < 10 ps)          A4 violated; A2 often violated too
+      - Combined   (all three extreme)  A1 + A3 + A4 + A2 violated
+    """
+    per = n_samples // 4
+    remainder = n_samples - 3 * per
+
+    def _regime(n, L_log_range, T_range, t_log_range, dtdx_log_range):
+        L     = np.exp(rng.uniform(*L_log_range, n))
+        T     = rng.uniform(*T_range, n)
+        t     = np.exp(rng.uniform(*t_log_range, n))
+        dT_dx = np.exp(rng.uniform(*dtdx_log_range, n))
+        T     = np.clip(T     * (1 + rng.normal(0, noise_frac, n)), 50.0, None)
+        L     = np.clip(L     * (1 + rng.normal(0, noise_frac, n)), 1e-11, None)
+        t     = np.clip(t     * (1 + rng.normal(0, noise_frac, n)), 1e-15, None)
+        dT_dx = np.clip(dT_dx * (1 + rng.normal(0, noise_frac, n)), 1.0, None)
+        dT_dt = dT_dx * L / t
+        vc, vs, vl, ve = compute_fourier_validity_labels(T, L, t, dT_dx)
+        return pd.DataFrame({
+            "T": T, "L": L, "t": t, "dT_dx": dT_dx, "dT_dt": dT_dt,
+            "Kn": SILICON_LAMBDA / L,
+            "Fo": _silicon_alpha(T) * t / L**2,
+            "A3_ratio": 1.65 * dT_dx * L / T,
+            "regime": "held_out",
+            "valid_continuum":         vc,
+            "valid_steady_state":      vs,
+            "valid_linear_response":   vl,
+            "valid_local_equilibrium": ve,
+        })
+
+    log = np.log
+    frames = [
+        _regime(per,       (log(1e-9), log(100e-9)),  (200.0, 1500.0),  (log(1e-9), log(1.0)),    (log(1e3), log(1e9))),
+        _regime(per,       (log(1e-6), log(1e-3)),    (1000.0, 1500.0), (log(1e-9), log(1.0)),    (log(1e4), log(1e9))),
+        _regime(per,       (log(1e-9), log(1e-3)),    (200.0, 1500.0),  (log(1e-15), log(10e-12)),(log(1e3), log(1e9))),
+        _regime(remainder, (log(1e-9), log(100e-9)),  (1000.0, 1500.0), (log(1e-15), log(10e-12)),(log(1e6), log(1e9))),
+    ]
+    return pd.concat(frames, ignore_index=True)
+
+
+def generate_fourier_dataset(
+    n_train: int = 5000,
+    n_held_out: int = 3000,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Generate training / held-out dataset pair for Fourier heat conduction.
+
+    Training:  all four Fourier assumptions satisfied by construction.
+    Held-out:  three failure regimes (nanoscale, high-T, ultrafast) + combined.
+    Each held-out point has labeled per-assumption validity flags.
+
+    Returns
+    -------
+    train_df, held_out_df
+    """
+    rng = np.random.default_rng(seed)
+    train_df    = generate_fourier_training(n_train, rng)
+    held_out_df = generate_fourier_held_out(n_held_out, rng)
+    return train_df, held_out_df
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------

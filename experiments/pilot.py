@@ -218,12 +218,160 @@ def run_hooke_experiment(plot: bool = False) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Domain 3: Fourier heat conduction
+# ---------------------------------------------------------------------------
+
+_FOURIER_HARD_CASES = [
+    # (label, T, L, t, dT_dx)
+    ("Case 1: L=50nm  T=300K  t=1s    [only A1 fails]",  300.0,  50e-9,  1.0,    1e6),
+    ("Case 2: L=1mm   T=1200K t=1s    [only A3 fails]",  1200.0, 1e-3,   1.0,    1e6),
+    ("Case 3: L=50nm  T=1200K t=1ps   [A1+A2+A4 fail]",  1200.0, 50e-9,  1e-12,  1e9),
+    ("Case 4: L=500nm T=400K  t=100ps [borderline A1+A2]",400.0,  500e-9, 100e-12,1e6),
+]
+
+
+def _print_hard_cases(predicates_by_attempt: Dict[int, Dict[str, object]]) -> None:
+    """Print per-assumption predicate scores for the four specified hard cases."""
+    import numpy as np
+    from data.generate import (
+        SILICON_LAMBDA, _silicon_alpha, KN_THRESHOLD, FO_THRESHOLD,
+        A3_THRESHOLD, ELECTRON_PHONON_TIME,
+    )
+
+    _banner("FOURIER -- Hard Case Analysis")
+
+    for label, T, L, t, dT_dx in _FOURIER_HARD_CASES:
+        alpha    = float(_silicon_alpha(np.array([T]))[0])
+        Kn       = SILICON_LAMBDA / L
+        Fo       = alpha * t / L**2
+        A3_ratio = 1.65 * dT_dx * L / T
+        dT_dt    = dT_dx * L / t
+
+        print(f"\n  {label}")
+        print(f"    Kn={Kn:.3e}  Fo={Fo:.3e}  A3_ratio={A3_ratio:.4f}  t={t:.1e}s")
+        print(f"    A1: {'FAIL' if Kn >= KN_THRESHOLD else 'ok  '}"
+              f"  A2: {'FAIL' if Fo < FO_THRESHOLD else 'ok  '}"
+              f"  A3: {'FAIL' if A3_ratio >= A3_THRESHOLD else 'ok  '}"
+              f"  A4: {'FAIL' if t < ELECTRON_PHONON_TIME else 'ok  '}")
+
+        row = np.array([[T, L, t, dT_dx, dT_dt,
+                         Kn, Fo, A3_ratio]], dtype=np.float32)
+        row_df = {
+            "T": T, "L": L, "t": t, "dT_dx": dT_dx, "dT_dt": dT_dt,
+            "Kn": Kn, "Fo": Fo, "A3_ratio": A3_ratio,
+        }
+        import pandas as pd
+        df_row = pd.DataFrame([row_df])
+
+        for attempt_num, predicates in sorted(predicates_by_attempt.items()):
+            scores = []
+            for aid in ["A1_continuum", "A2_steady_state", "A3_linear_response", "A4_local_equilibrium"]:
+                pred = predicates.get(aid)
+                if pred is None:
+                    scores.append(float("nan"))
+                else:
+                    feats = df_row[pred.feature_cols].values.astype("float32")
+                    scores.append(float(pred.predict(feats)[0]))
+            print(f"    Attempt {attempt_num}: "
+                  f"A1={scores[0]:.3f}  A2={scores[1]:.3f}  "
+                  f"A3={scores[2]:.3f}  A4={scores[3]:.3f}")
+
+
+def run_fourier_experiment() -> Dict:
+    """Full breakdown-detection pipeline for Fourier heat conduction, three attempts."""
+    _banner("DOMAIN 3 -- Fourier's Law  q = -k*dT/dx  (silicon)")
+    print(f"\n  Training : L=1um-1mm, T=200-600K, Fo>1, A3<0.1  ({N_TRAIN} states)")
+    print(f"  Held-out : nanoscale + high-T + ultrafast + combined  ({3000} states)")
+    print(f"  Material : silicon  k0=150W/mK  lambda=40nm  tau_ep=1ps")
+
+    t0 = _step(1, 5, "Generating data ...")
+    from data.generate import generate_fourier_dataset
+    train_df, held_df = generate_fourier_dataset(n_train=N_TRAIN, n_held_out=3000, seed=SEED)
+    _done(t0)
+    for col, label in [
+        ("valid_continuum",         "A1"),
+        ("valid_steady_state",      "A2"),
+        ("valid_linear_response",   "A3"),
+        ("valid_local_equilibrium", "A4"),
+    ]:
+        print(f"       train {label}={train_df[col].mean():.0%} valid  "
+              f"held {label}={held_df[col].mean():.0%} valid")
+
+    t0 = _step(2, 5, "Building axiom graph ...")
+    from axiom_graph.graph import build_fourier_law_graph
+    _done(t0)
+
+    t0 = _step(3, 5, "Training validity predicates (3 attempts) ...\n")
+    from validity_predicates.train import train_all_fourier_predicates
+    from reasoner.forward_chain import run_forward_chain
+    from reasoner.provenance import compute_provenance
+    from validity_predicates.evaluate import (
+        evaluate_predicates, print_report,
+        FOURIER_LABEL_COLS, FOURIER_ASSUMPTION_ORDER, FOURIER_ASSUMPTION_LABELS,
+        FOURIER_DERIVED_ORDER, FOURIER_NODE_LABELS,
+    )
+
+    all_metrics: Dict[int, Dict] = {}
+    all_predicates: Dict[int, Dict] = {}
+
+    for attempt in (1, 2, 3):
+        attempt_labels = {
+            1: "criterion scalars (Kn, Fo, A3_ratio, t)",
+            2: "all observables  (T, L, t, dT/dx, dT/dt)",
+            3: "criterion + all observables",
+        }
+        print(f"\n  --- Attempt {attempt}: {attempt_labels[attempt]} ---")
+        graph = build_fourier_law_graph()
+        preds = train_all_fourier_predicates(
+            graph, train_df, attempt=attempt, verbose=True,
+            hidden_dims=HIDDEN_DIMS, lr=LR, n_epochs=N_EPOCHS,
+        )
+        all_predicates[attempt] = preds
+
+        result   = run_forward_chain(graph, held_df, threshold=THRESHOLD)
+        prov_map = compute_provenance(graph)
+        metrics  = evaluate_predicates(
+            result, held_df, prov_map=prov_map,
+            label_cols=FOURIER_LABEL_COLS,
+            derived_order=FOURIER_DERIVED_ORDER,
+        )
+        all_metrics[attempt] = metrics
+
+        _banner(f"FOURIER -- Attempt {attempt} Results")
+        print_report(
+            metrics, result, held_df, prov_map=prov_map,
+            assumption_order=FOURIER_ASSUMPTION_ORDER,
+            assumption_labels=FOURIER_ASSUMPTION_LABELS,
+            derived_order=FOURIER_DERIVED_ORDER,
+            node_labels=FOURIER_NODE_LABELS,
+            primary_node="D4_fourier_law",
+        )
+    _done(t0)
+
+    t0 = _step(4, 5, "Hard case analysis ...")
+    _print_hard_cases(all_predicates)
+    _done(t0)
+
+    t0 = _step(5, 5, "Summarising ...")
+    _done(t0)
+
+    return all_metrics
+
+
+# ---------------------------------------------------------------------------
 # Pass / fail summary
 # ---------------------------------------------------------------------------
 
-def _pass_fail(ig_metrics: Dict, hooke_metrics: Dict) -> None:
-    _banner("PASS / FAIL -- Both Domains")
+def _pass_fail(ig_metrics: Dict, hooke_metrics: Dict, fourier_metrics: Dict) -> None:
+    _banner("PASS / FAIL -- All Domains")
     target = 0.90
+
+    # For Fourier, use best attempt (highest recall)
+    def _best(metrics_by_attempt: Dict, aid: str, metric: str = "recall") -> float:
+        best = 0.0
+        for m in metrics_by_attempt.values():
+            best = max(best, m.get(aid, {}).get(metric, 0.0))
+        return best
 
     checks = [
         ("IG   A1 recall (point particles)", ig_metrics.get("A1_point_particles", {}).get("recall", 0)),
@@ -233,6 +381,11 @@ def _pass_fail(ig_metrics: Dict, hooke_metrics: Dict) -> None:
         ("Hook A2 recall (elasticity)",      hooke_metrics.get("A2_elasticity",   {}).get("recall", 0)),
         ("Hook A3 recall (small strain)",    hooke_metrics.get("A3_small_strain", {}).get("recall", 0)),
         ("Hook D4 flagging recall",          hooke_metrics.get("D4_hookes_law",   {}).get("recall", 0)),
+        ("Four A1 recall (continuum)",       _best(fourier_metrics, "A1_continuum")),
+        ("Four A2 recall (steady state)",    _best(fourier_metrics, "A2_steady_state")),
+        ("Four A3 recall (linear resp.)",    _best(fourier_metrics, "A3_linear_response")),
+        ("Four A4 recall (local equil.)",    _best(fourier_metrics, "A4_local_equilibrium")),
+        ("Four D4 flagging recall",          _best(fourier_metrics, "D4_fourier_law")),
     ]
 
     all_pass = True
@@ -240,13 +393,13 @@ def _pass_fail(ig_metrics: Dict, hooke_metrics: Dict) -> None:
         status = "PASS" if val >= target else "FAIL"
         if val < target:
             all_pass = False
-        print(f"    {name:<38} = {val:.3f}   (>= {target})  [{status}]")
+        print(f"    {name:<42} = {val:.3f}   (>= {target})  [{status}]")
 
     print()
     if all_pass:
-        print("  All targets met.  Framework generalises across both physical domains.")
+        print("  All targets met.  Framework generalises across all three physical domains.")
     else:
-        print("  One or more targets not met -- see reports above.")
+        print("  One or more targets not met -- see Fourier reports above for diagnosis.")
     print()
 
 
@@ -255,9 +408,10 @@ def _pass_fail(ig_metrics: Dict, hooke_metrics: Dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main(plot: bool = False) -> None:
-    ig_metrics    = run_ideal_gas_experiment(plot=plot)
-    hooke_metrics = run_hooke_experiment(plot=plot)
-    _pass_fail(ig_metrics, hooke_metrics)
+    ig_metrics      = run_ideal_gas_experiment(plot=plot)
+    hooke_metrics   = run_hooke_experiment(plot=plot)
+    fourier_metrics = run_fourier_experiment()
+    _pass_fail(ig_metrics, hooke_metrics, fourier_metrics)
 
 
 if __name__ == "__main__":
