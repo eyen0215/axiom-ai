@@ -54,3 +54,7 @@ Thumbs.db
 *.pt
 *.pth
 *.ckpt
+
+# Claude
+CLAUDE.md 
+DECISIONS.md
