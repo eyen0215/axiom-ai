@@ -686,6 +686,82 @@ def generate_fourier_dataset(
     return train_df, held_out_df
 
 
+# ===========================================================================
+# RESIDUAL-BASED IDEAL GAS DOMAIN (Pilot 1 Reformulation)
+# ===========================================================================
+#
+# Generates (P, V, T, n) samples using the van der Waals EOS for CO2.
+# The predicate trained on this data never sees a, b, or any derived
+# criterion — only raw observables and the ideal-gas residual |PV/nRT − 1|.
+# ---------------------------------------------------------------------------
+
+CO2_A_VDW = 3.592    # L^2 atm / mol^2  (CO2 van der Waals attraction)
+CO2_B_VDW = 0.04267  # L / mol           (CO2 van der Waals excluded volume)
+
+
+def generate_ideal_gas_residual_data(
+    n_samples: int,
+    P_range: tuple,
+    T_range: tuple = (300, 500),
+    n_range: tuple = (0.5, 2.0),
+    seed=None,
+) -> dict:
+    """Generate (P, V, T, n) samples via the CO2 van der Waals EOS.
+
+    Samples P, T, n uniformly, then solves for the real volume V using the
+    van der Waals cubic. This ensures that at high pressure the samples
+    reflect real-gas behavior, not ideal-gas behavior.
+
+    Returns the ideal-gas residual |PV/nRT − 1|, which measures how far the
+    sample deviates from PV = nRT without requiring knowledge of a, b, or any
+    validity threshold.
+
+    The predicate trained on this data is never given CO2_A_VDW, CO2_B_VDW,
+    or any breakdown criterion — only raw [P, V, T, n] observables.
+
+    Parameters
+    ----------
+    n_samples : number of samples to attempt (some may be dropped for NaN)
+    P_range   : (P_min, P_max) in atm
+    T_range   : (T_min, T_max) in K
+    n_range   : (n_min, n_max) in mol
+    seed      : RNG seed for reproducibility
+
+    Returns
+    -------
+    dict with keys P, V, T, n, residual (1-D numpy arrays, same length).
+    """
+    rng = np.random.default_rng(seed)
+
+    P = rng.uniform(*P_range, size=n_samples)
+    T = rng.uniform(*T_range, size=n_samples)
+    n = rng.uniform(*n_range, size=n_samples)
+
+    # Solve V from van der Waals EOS for each (P, T, n):
+    # P V^3 - (n b P + n R T) V^2 + a n^2 V - a b n^3 = 0
+    V = np.empty_like(P)
+    for i in range(n_samples):
+        coeffs = [
+            P[i],
+            -(n[i] * CO2_B_VDW * P[i] + n[i] * R * T[i]),
+            CO2_A_VDW * n[i] ** 2,
+            -CO2_A_VDW * CO2_B_VDW * n[i] ** 3,
+        ]
+        roots = np.roots(coeffs)
+        real_roots = roots[np.isreal(roots)].real
+        # Physical root: largest positive real root greater than n*b (excluded volume)
+        valid_roots = real_roots[real_roots > n[i] * CO2_B_VDW]
+        V[i] = float(np.max(valid_roots)) if len(valid_roots) > 0 else np.nan
+
+    # Drop degenerate samples where root-finding failed
+    mask = ~np.isnan(V)
+    P, T, n, V = P[mask], T[mask], n[mask], V[mask]
+
+    residual = np.abs((P * V) / (n * R * T) - 1.0)
+
+    return {"P": P, "V": V, "T": T, "n": n, "residual": residual}
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
