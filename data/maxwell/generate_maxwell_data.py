@@ -70,15 +70,34 @@ def compute_a2_ratio(frequency):
 
 
 # ---------------------------------------------------------------------------
+# log_criterion functions for raw-feature training
+# ---------------------------------------------------------------------------
+
+def log_criterion_a1_from_field(E_field):
+    """Positive when E_field < E_sat (linear regime holds)."""
+    return np.clip(np.log(E_sat / (E_field + 1e-30)), -20.0, 20.0)
+
+
+def log_criterion_a2_from_freq(frequency):
+    """Positive when frequency < f_boundary ~ 79.9 kHz."""
+    f_boundary = 0.01 * sigma_eff / (2.0 * np.pi * epsilon)
+    return np.clip(np.log(f_boundary / (frequency + 1e-30)), -20.0, 20.0)
+
+
+# ---------------------------------------------------------------------------
 # Training data generators
 # ---------------------------------------------------------------------------
 
 def generate_train_a1():
-    """5000 samples, valid A1 regime (E_field << E_sat)."""
-    E_field  = np.exp(rng.uniform(np.log(1e2), np.log(1e6), N_TRAIN))
-    resid    = compute_a1_resid(E_field)
-    features = resid[:, np.newaxis]           # (N, 1) — raw residual, no log transform
-    lc       = log_criterion_a1(resid)
+    """5000 samples, valid A1 regime.
+
+    Feature: E_field (V/m), log-uniform in [1e2, 1e7] — independent state variable.
+    log_criterion: log(E_sat / E_field); positive when E_field < E_sat.
+    log_transform_cols=(0,) applied internally by ValidityPredicate.
+    """
+    E_field  = np.exp(rng.uniform(np.log(1e2), np.log(1e7), N_TRAIN))
+    features = E_field[:, np.newaxis]         # (N, 1) — raw E_field
+    lc       = log_criterion_a1_from_field(E_field)
     is_valid = np.ones(N_TRAIN, dtype=bool)
     return features, lc, is_valid
 
@@ -86,15 +105,13 @@ def generate_train_a1():
 def generate_train_a2():
     """5000 samples, valid A2 regime (low frequency).
 
-    Note: log-uniform sampling up to 1e6 Hz includes ~18% of samples above the
-    79.9 kHz boundary (ratio > 0.01, log_criterion < 0).  These act as soft
-    negative examples; the skip still extrapolates correctly to Scenario B
-    (ratio >> 0.01) because log(ratio) grows monotonically with frequency.
+    Feature: frequency (Hz), log-uniform in [1, 1e4] — independent state variable.
+    log_criterion: log(f_boundary / frequency); positive when below ~79.9 kHz.
+    log_transform_cols=(0,) applied internally by ValidityPredicate.
     """
-    f        = np.exp(rng.uniform(np.log(1.0), np.log(1e6), N_TRAIN))
-    ratio    = compute_a2_ratio(f)
-    features = ratio[:, np.newaxis]           # (N, 1) — ratio stored directly
-    lc       = log_criterion_a2(ratio)
+    f        = np.exp(rng.uniform(np.log(1.0), np.log(1e4), N_TRAIN))
+    features = f[:, np.newaxis]               # (N, 1) — raw frequency
+    lc       = log_criterion_a2_from_freq(f)
     is_valid = np.ones(N_TRAIN, dtype=bool)
     return features, lc, is_valid
 
@@ -106,17 +123,14 @@ def generate_train_a2():
 def generate_test_a():
     """Scenario A: A1 fires (high E-field), A2 silent (low frequency).
 
-    Uses the nonlinear tanh saturation model for A1_features so that
-    E >> E_sat produces resid >> 0.05.  The noise model (compute_a1_resid)
-    would give identical resid to training regardless of E_field magnitude.
+    A1_features = E_field (V/m); predicate trained on E_field with log_transform_cols=(0,).
+    A2_features = frequency (Hz); predicate trained on frequency with log_transform_cols=(0,).
     """
     E_field = np.exp(rng.uniform(np.log(5e8), np.log(1e10), N_TEST))
     f       = np.exp(rng.uniform(np.log(1.0),  np.log(100.0), N_TEST))
-    resid   = compute_a1_resid_physical(E_field)
-    ratio   = compute_a2_ratio(f)
-    A1_feat = resid[:, np.newaxis]
-    A2_feat = ratio[:, np.newaxis]
-    lc = log_criterion_a1(resid)   # negative: resid >> 0.05 => log_criterion << 0
+    A1_feat = E_field[:, np.newaxis]
+    A2_feat = f[:, np.newaxis]
+    lc = log_criterion_a1_from_field(E_field)
     return {
         "features":      A1_feat,
         "log_criterion": lc,
@@ -136,13 +150,11 @@ def generate_test_b():
     """
     f       = np.exp(rng.uniform(np.log(1e8), np.log(1e10), N_TEST))
     E_field = np.exp(rng.uniform(np.log(1e2), np.log(1e6),  N_TEST))
-    resid   = compute_a1_resid(E_field)
-    ratio   = compute_a2_ratio(f)
-    A1_feat = resid[:, np.newaxis]
-    A2_feat = ratio[:, np.newaxis]
+    A1_feat = E_field[:, np.newaxis]
+    A2_feat = f[:, np.newaxis]
     return {
         "features":      A2_feat,
-        "log_criterion": log_criterion_a2(ratio),
+        "log_criterion": log_criterion_a2_from_freq(f),
         "is_valid":      np.zeros(N_TEST, dtype=bool),
         "A1_features":   A1_feat,
         "A2_features":   A2_feat,
@@ -152,16 +164,18 @@ def generate_test_b():
 
 
 def generate_test_c():
-    """Scenario C: valid holdout (neither fires) — FPR check."""
+    """Scenario C: valid holdout (neither fires) — FPR check.
+
+    E_field in [1e2, 1e6] V/m (below E_sat=1e8) and frequency in [1, 1e4] Hz
+    (below f_boundary~79.9 kHz) so all samples are in the valid regime.
+    """
     E_field = np.exp(rng.uniform(np.log(1e2), np.log(1e6), N_TEST))
-    f       = np.exp(rng.uniform(np.log(1.0),  np.log(1e6), N_TEST))
-    resid   = compute_a1_resid(E_field)
-    ratio   = compute_a2_ratio(f)
-    A1_feat = resid[:, np.newaxis]
-    A2_feat = ratio[:, np.newaxis]
+    f       = np.exp(rng.uniform(np.log(1.0),  np.log(1e4), N_TEST))
+    A1_feat = E_field[:, np.newaxis]
+    A2_feat = f[:, np.newaxis]
     return {
         "features":      A1_feat,
-        "log_criterion": log_criterion_a1(resid),
+        "log_criterion": log_criterion_a1_from_field(E_field),
         "is_valid":      np.ones(N_TEST, dtype=bool),
         "A1_features":   A1_feat,
         "A2_features":   A2_feat,
@@ -222,11 +236,11 @@ if __name__ == "__main__":
 
         n       = len(data["A1_features"])
         lc_mean = float(np.mean(data["log_criterion"]))
-        a1_resid_mean = float(np.mean(data["A1_features"]))
-        a2_ratio_mean = float(np.mean(data["A2_features"]))
+        a1_feat_mean = float(np.mean(data["A1_features"]))
+        a2_feat_mean = float(np.mean(data["A2_features"]))
         print(f"  {name}: n={n}, "
-              f"A1_feat mean={a1_resid_mean:.4e}, "
-              f"A2_feat mean={a2_ratio_mean:.4e}, "
+              f"A1_feat(E_field) mean={a1_feat_mean:.4e}, "
+              f"A2_feat(freq) mean={a2_feat_mean:.4e}, "
               f"a1_breaks={data['a1_breaks']}, "
               f"a2_breaks={data['a2_breaks']}, "
               f"mean_lc={lc_mean:.3f}")

@@ -47,17 +47,13 @@ LOG_PATH = Path(__file__).parent.parent / "RESULTS_LOG.md"
 
 FIRE_THRESHOLD = 0.5
 
-# LE A2 uses ratio = sigma_vm / (E * eps_eq) as its second feature (see
-# generate_le_data.py).  Test .npz files store raw sigma_vm, so we convert.
-_LE_E = 200e9  # Pa
+def _le_a2_eps_features(raw: np.ndarray) -> np.ndarray:
+    """Extract eps_eq column from LE A2 test features.
 
-
-def _le_a2_ratio_features(raw: np.ndarray) -> np.ndarray:
-    """Convert [eps_eq, sigma_vm] test features to [eps_eq, |ratio-1|] for A2."""
-    eps_eq   = raw[:, 0]
-    sigma_vm = raw[:, 1]
-    residual = np.abs(sigma_vm / (_LE_E * eps_eq + 1e-10) - 1.0)
-    return np.column_stack([eps_eq, residual])
+    Test .npz files store A2_features as [eps_eq, sigma_vm]; rebuilt A2 predicate
+    uses only eps_eq (column 0) as its single independent feature.
+    """
+    return raw[:, :1]   # (N, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +140,8 @@ def evaluate_le() -> dict:
     pred_a1.load_state_dict(torch.load(SAVE_DIR / "le_A1.pt", weights_only=False))
     pred_a1.eval()
 
-    pred_a2 = ValidityPredicate(n_features=2, log_transform_cols=(0, 1),
-                                feature_cols=["eps_eq", "sigma_vm"])
+    pred_a2 = ValidityPredicate(n_features=1, log_transform_cols=(),
+                                feature_cols=["eps_eq"])
     pred_a2.load_state_dict(torch.load(SAVE_DIR / "le_A2.pt", weights_only=False))
     pred_a2.eval()
 
@@ -167,7 +163,7 @@ def evaluate_le() -> dict:
         N = len(d["A1_features"])
         sc = {
             "A1": pred_a1.predict(d["A1_features"]),
-            "A2": pred_a2.predict(_le_a2_ratio_features(d["A2_features"])),
+            "A2": pred_a2.predict(_le_a2_eps_features(d["A2_features"])),
             "A5": score_shifted(pred_a5, d["A5_features"], a5_shift),
         }
         for k in pool:
@@ -180,7 +176,7 @@ def evaluate_le() -> dict:
     d_c = np.load(LE_DATA / "test_scenario_C.npz")
     sc_c = {
         "A1": pred_a1.predict(d_c["A1_features"]),
-        "A2": pred_a2.predict(_le_a2_ratio_features(d_c["A2_features"])),
+        "A2": pred_a2.predict(_le_a2_eps_features(d_c["A2_features"])),
         "A5": score_shifted(pred_a5, d_c["A5_features"], a5_shift),
     }
     fr = {k: float(np.mean(sc_c[k] < FIRE_THRESHOLD)) for k in sc_c}
@@ -215,11 +211,19 @@ def evaluate_maxwell() -> dict:
 
     if a1_path.exists() and a2_path.exists() and data_b.exists():
         # --- Full evaluation with trained predicates ---
+        # A1: feature = E_field (V/m), log_transform_cols=(0,)
+        ckpt_a1 = torch.load(a1_path, weights_only=False)
         pred_a1 = ValidityPredicate(n_features=1, log_transform_cols=(0,),
                                     feature_cols=["E_field"])
-        pred_a1.load_state_dict(torch.load(a1_path, weights_only=False))
+        if isinstance(ckpt_a1, dict) and "model" in ckpt_a1:
+            pred_a1.load_state_dict(ckpt_a1["model"])
+            a1_shift = float(ckpt_a1["shift"])
+        else:
+            pred_a1.load_state_dict(ckpt_a1)
+            a1_shift = 0.0
         pred_a1.eval()
 
+        # A2: feature = frequency (Hz), log_transform_cols=(0,)
         ckpt_a2 = torch.load(a2_path, weights_only=False)
         pred_a2 = ValidityPredicate(n_features=1, log_transform_cols=(0,),
                                     feature_cols=["frequency"])
@@ -244,7 +248,8 @@ def evaluate_maxwell() -> dict:
                 continue
             d = np.load(p)
             N = len(d["A1_features"])
-            sc_a1 = pred_a1.predict(d["A1_features"])
+            sc_a1 = (score_shifted(pred_a1, d["A1_features"], a1_shift) if a1_shift
+                     else pred_a1.predict(d["A1_features"]))
             sc_a2 = (score_shifted(pred_a2, d["A2_features"], a2_shift) if a2_shift
                      else pred_a2.predict(d["A2_features"]))
             for k, sc in [("A1", sc_a1), ("A2", sc_a2)]:
@@ -260,7 +265,8 @@ def evaluate_maxwell() -> dict:
 
         # Key scenario: Scenario B
         d_b  = np.load(data_b)
-        sc_a1_b = pred_a1.predict(d_b["A1_features"])
+        sc_a1_b = (score_shifted(pred_a1, d_b["A1_features"], a1_shift) if a1_shift
+                   else pred_a1.predict(d_b["A1_features"]))
         sc_a2_b = (score_shifted(pred_a2, d_b["A2_features"], a2_shift) if a2_shift
                    else pred_a2.predict(d_b["A2_features"]))
         fr_a1 = float(np.mean(sc_a1_b < FIRE_THRESHOLD))

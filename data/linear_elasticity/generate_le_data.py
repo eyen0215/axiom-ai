@@ -48,24 +48,16 @@ def generate_train_a1():
 
 
 def generate_train_a2():
-    epsilon_eq = rng.uniform(0.0001, 0.008, N_TRAIN)
-    dev_frac = np.exp(rng.uniform(np.log(1e-5), np.log(0.05), N_TRAIN))
-    sigma_vm = E * epsilon_eq * (1.0 + dev_frac)
-    # Store ratio = sigma_vm / (E * eps_eq) as feature 2 instead of raw sigma_vm.
-    # After log transform this becomes log(1 + dev_frac) ≈ dev_frac, which is the
-    # direct deviation signal the skip needs.  With raw sigma_vm the deviation
-    # (0-5%) is swamped 50:1 by eps_eq variation in log space, so the skip learns
-    # near-zero weights and cannot extrapolate to Scenario B where
-    # sigma_vm / (E * eps_eq) ≈ 0.15-0.50 (elasto-plastic softening).
-    # |sigma_vm/(E*eps_eq) - 1| = dev_frac in the valid regime (sigma_vm ≥ E*eps_eq).
-    # Storing the MAGNITUDE of the deviation rather than raw ratio or raw sigma_vm
-    # ensures the skip extrapolates correctly into Scenario B where sigma_vm < E*eps_eq
-    # (|ratio-1| still grows there, so the skip fires; with raw ratio the model
-    # extrapolates in the wrong direction because ratio < 1 looks "more valid" than
-    # ratio ∈ [1.0, 1.05]).
-    residual_feat = np.abs(sigma_vm / (E * epsilon_eq + 1e-10) - 1.0)  # = dev_frac here
-    features = np.column_stack([epsilon_eq, residual_feat])             # (N, 2)
-    lc = log_criterion_a2(epsilon_eq, sigma_vm)
+    """Train on eps_eq only (independent state variable).
+
+    Boundary: eps_yield = sigma_yield / E = 0.00125.
+    Training range [0.0001, 0.001] is strictly sub-yield.
+    log_criterion = clip(log(eps_yield / eps_eq), -20, 20): positive below yield.
+    """
+    epsilon_yield = sigma_yield / E   # 0.00125
+    epsilon_eq = rng.uniform(0.0001, 0.001, N_TRAIN)
+    features = epsilon_eq[:, np.newaxis]   # (N, 1) — single independent feature
+    lc = np.clip(np.log(epsilon_yield / epsilon_eq), -20.0, 20.0)
     is_valid = np.ones(N_TRAIN, dtype=bool)
     return features, lc, is_valid
 
@@ -120,8 +112,12 @@ def generate_test_scenario_b():
 
 
 def generate_test_scenario_c():
-    """A5 breaks (high frequency); A1 and A2 hold (small strain, linear)."""
-    epsilon_eq = rng.uniform(0.0001, 0.005, N_TEST)
+    """A5 breaks (high frequency); A1 and A2 hold (small strain, sub-yield, linear).
+
+    eps_eq capped at 0.001 (below eps_yield=0.00125) so the rebuilt le_A2
+    predicate [eps_eq only] does not falsely fire on this valid-A2 scenario.
+    """
+    epsilon_eq = rng.uniform(0.0001, 0.001, N_TEST)
     f = np.exp(rng.uniform(np.log(1e4), np.log(1e6), N_TEST))
     sigma_vm = E * epsilon_eq   # linear — A2 holds
 
