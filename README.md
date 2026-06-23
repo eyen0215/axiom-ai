@@ -1,4 +1,4 @@
-# Axiom-AI: Assumption-Aware Theory Breakdown Detection
+# PRISM: Prospective Regime Inference via Symbolic Modeling
 
 A neurosymbolic system that detects when a physical theory breaks down in regimes never seen during training — by learning from the theory's own residual rather than from labeled breakdown events.
 
